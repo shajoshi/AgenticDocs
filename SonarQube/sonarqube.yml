@@ -1,0 +1,129 @@
+name: SonarQube On-Demand Analysis
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  sonar-scan:
+    runs-on: ubuntu-latest
+    outputs:
+      vm_started: ${{ steps.check-vm.outputs.vm_started }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Check VM Status and Start if Needed
+        id: check-vm
+        run: |
+          VM_STATUS=$(az vm get-instance-view --resource-group Rivvun_Platform --name rivvundevops1 --query instanceView.statuses[1].code -o tsv)
+          echo "Current VM status: $VM_STATUS"
+          if [[ "$VM_STATUS" == "PowerState/running" ]]; then
+            echo "VM is already running"
+            echo "vm_started=false" >> $GITHUB_OUTPUT
+          else
+            echo "VM is not running, starting it..."
+            az vm start --resource-group Rivvun_Platform --name rivvundevops1
+            echo "vm_started=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Wait for SonarQube to be Ready
+        run: |
+          echo "Waiting for SonarQube to start..."
+          timeout 300s bash -c '
+          until curl -s -u ${{ secrets.SONAR_TOKEN }}: "${{ secrets.SONAR_HOST_URL }}/api/system/status" | grep -q "UP"; do
+            echo "SonarQube is starting..."
+            sleep 10
+          done'
+          echo "SonarQube is UP and running!"
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: Wait for Analysis Completion
+        run: |
+          echo "Waiting for analysis to complete..."
+          sleep 30
+          timeout 600s bash -c '
+          while true; do
+            STATUS=$(curl -s -u ${{ secrets.SONAR_TOKEN }}: "${{ secrets.SONAR_HOST_URL }}/api/ce/component?component=Rivvun-Intelligence" | grep -o '"status":"[^"]*"' | head -1 | cut -d"\"" -f4)
+            echo "Analysis status: $STATUS"
+            if [[ "$STATUS" == "SUCCESS" ]]; then
+              echo "Analysis completed successfully!"
+              break
+            elif [[ "$STATUS" == "FAILED" || "$STATUS" == "CANCELED" ]]; then
+              echo "Analysis failed or was canceled"
+              exit 1
+            fi
+            sleep 15
+          done'
+
+      - name: Create Reports Directory
+        run: mkdir -p sonar-reports
+
+      - name: Generate and Download Executive Report
+        run: |
+          echo "Generating Executive Report..."
+          # Trigger report generation
+          curl -s -u ${{ secrets.SONAR_TOKEN }}: \
+            -X POST "${{ secrets.SONAR_HOST_URL }}/api/report" \
+            -d "component=Rivvun-Intelligence" \
+            -d "branch=main" \
+            -d "format=PDF" \
+            -d "type=executive"
+          
+          # Wait for report generation
+          sleep 10
+          
+          # Download the report using the web interface
+          curl -s -u ${{ secrets.SONAR_TOKEN }}: \
+            "${{ secrets.SONAR_HOST_URL }}/api/report/download?component=Rivvun-Intelligence&branch=main&format=PDF&type=executive" \
+            -o sonar-reports/executive-report.pdf || echo "Executive report download attempted"
+
+      - name: Generate and Download Breakdown Summary Report
+        run: |
+          echo "Generating Breakdown Summary Report..."
+          # Trigger report generation
+          curl -s -u ${{ secrets.SONAR_TOKEN }}: \
+            -X POST "${{ secrets.SONAR_HOST_URL }}/api/report" \
+            -d "component=Rivvun-Intelligence" \
+            -d "branch=main" \
+            -d "format=PDF" \
+            -d "type=breakdown"
+          
+          # Wait for report generation
+          sleep 10
+          
+          # Download the report
+          curl -s -u ${{ secrets.SONAR_TOKEN }}: \
+            "${{ secrets.SONAR_HOST_URL }}/api/report/download?component=Rivvun-Intelligence&branch=main&format=PDF&type=breakdown" \
+            -o sonar-reports/breakdown-summary-report.pdf || echo "Breakdown report download attempted"
+
+      - name: List Downloaded Reports
+        run: |
+          echo "Reports in sonar-reports directory:"
+          ls -la sonar-reports/ || echo "Directory may be empty"
+
+      - name: Upload Reports as Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonarqube-pdf-reports
+          path: sonar-reports/*.pdf
+          retention-days: 30
+
+      - name: Shutdown VM (if started by this workflow)
+        if: steps.check-vm.outputs.vm_started == 'true'
+        run: |
+          echo "Shutting down VM as it was started by this workflow..."
+          az vm deallocate --resource-group Rivvun_Platform --name rivvundevops1
