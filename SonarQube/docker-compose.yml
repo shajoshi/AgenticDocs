@@ -21,8 +21,8 @@ services:
       - db
     networks:
       - sonarnet
-    ports:
-      - "9000:9000"
+    # ports: (Left commented out for security)
+    #   - "9000:9000"
     environment:
       - SONAR_JDBC_URL=jdbc:postgresql://db:5432/sonarqube
       - SONAR_JDBC_USERNAME=sonar
@@ -32,6 +32,33 @@ services:
       - sonarqube_extensions:/opt/sonarqube/extensions
       - sonarqube_logs:/opt/sonarqube/logs
     restart: unless-stopped
+
+  nginx:
+    image: nginx:latest
+    container_name: nginx-proxy
+    networks:
+      - sonarnet  # <--- CRITICAL FIX: Add this
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf:/etc/nginx/conf.d
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    depends_on:
+      - sonarqube
+    restart: unless-stopped # <--- Added for stability
+
+  certbot:
+    image: certbot/certbot
+    container_name: certbot
+    networks:
+      - sonarnet #(Optional, but good for consistency)
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+    restart: unless-stopped # <--- Added for stability
 
 networks:
   sonarnet:

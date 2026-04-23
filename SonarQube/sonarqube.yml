@@ -1,13 +1,17 @@
 name: SonarQube On-Demand Analysis
 
 on:
-  push:
-    branches: [main]
+  #push:
+  #  branches: [main]
   workflow_dispatch:
 
 jobs:
   sonar-scan:
     runs-on: ubuntu-latest
+    # THIS BLOCK MUST BE HERE
+    permissions:
+      contents: read
+      pull-requests: write
     outputs:
       vm_started: ${{ steps.check-vm.outputs.vm_started }}
     steps:
@@ -39,7 +43,7 @@ jobs:
         run: |
           echo "Waiting for SonarQube to start..."
           timeout 300s bash -c '
-          until curl -s -u ${{ secrets.SONAR_TOKEN }}: "${{ secrets.SONAR_HOST_URL }}/api/system/status" | grep -q "UP"; do
+          until curl -s -u ${{ secrets.SONAR_TOKEN }}: "${{ vars.SONAR_HOST_URL }}/api/system/status" | grep -q "UP"; do
             echo "SonarQube is starting..."
             sleep 10
           done'
@@ -47,81 +51,61 @@ jobs:
 
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@master
+        # This forces the scanner to ignore the PR/CI metadata check
+        with:
+          args: >
+            -Dsonar.scm.disabled=true
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
 
       - name: Wait for Analysis Completion
         run: |
-          echo "Waiting for analysis to complete..."
-          sleep 30
-          timeout 600s bash -c '
+          echo "Extracting Project Key..."
+          # This command finds the projectKey line, splits by '=', and trims whitespace
+          # PROJECT_KEY=$(grep 'sonar.projectKey' sonar-project.properties | cut -d'=' -f2 | xargs)
+          PROJECT_KEY=$(grep 'sonar.projectKey' sonar-project.properties | cut -d'=' -f2 | tr -d '\r\n ')
+          echo "Project Key identified as: $PROJECT_KEY"
+
+          sleep 10
+          SONAR_TOKEN="${{ secrets.SONAR_TOKEN }}"
+          SONAR_HOST_URL="${{ vars.SONAR_HOST_URL }}"
+          START_TIME=$(date +%s)
+          TIMEOUT=600
+
           while true; do
-            STATUS=$(curl -s -u ${{ secrets.SONAR_TOKEN }}: "${{ secrets.SONAR_HOST_URL }}/api/ce/component?component=Rivvun-Intelligence" | grep -o '"status":"[^"]*"' | head -1 | cut -d"\"" -f4)
-            echo "Analysis status: $STATUS"
-            if [[ "$STATUS" == "SUCCESS" ]]; then
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+            if [ $ELAPSED -ge $TIMEOUT ]; then
+              echo "Timeout waiting for analysis after ${TIMEOUT}s"
+              exit 1
+            fi
+
+            # Using the dynamic $PROJECT_KEY variable here
+            RESPONSE=$(curl -s -w "\n%{http_code}" -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/ce/component?component=$PROJECT_KEY")
+            
+            HTTP_CODE=$(printf '%s' "$RESPONSE" | tail -n1)
+            BODY=$(printf '%s' "$RESPONSE" | head -n -1)
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "API returned HTTP $HTTP_CODE, retrying..."
+              sleep 15
+              continue
+            fi
+
+            STATUS=$(printf '%s' "$BODY" | jq -r '.current.status // "PENDING"')
+            echo "Analysis status: $STATUS (elapsed: ${ELAPSED}s)"
+
+            if [ "$STATUS" = "SUCCESS" ]; then
               echo "Analysis completed successfully!"
               break
-            elif [[ "$STATUS" == "FAILED" || "$STATUS" == "CANCELED" ]]; then
+            elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CANCELED" ]; then
               echo "Analysis failed or was canceled"
               exit 1
             fi
             sleep 15
-          done'
-
-      - name: Create Reports Directory
-        run: mkdir -p sonar-reports
-
-      - name: Generate and Download Executive Report
-        run: |
-          echo "Generating Executive Report..."
-          # Trigger report generation
-          curl -s -u ${{ secrets.SONAR_TOKEN }}: \
-            -X POST "${{ secrets.SONAR_HOST_URL }}/api/report" \
-            -d "component=Rivvun-Intelligence" \
-            -d "branch=main" \
-            -d "format=PDF" \
-            -d "type=executive"
-          
-          # Wait for report generation
-          sleep 10
-          
-          # Download the report using the web interface
-          curl -s -u ${{ secrets.SONAR_TOKEN }}: \
-            "${{ secrets.SONAR_HOST_URL }}/api/report/download?component=Rivvun-Intelligence&branch=main&format=PDF&type=executive" \
-            -o sonar-reports/executive-report.pdf || echo "Executive report download attempted"
-
-      - name: Generate and Download Breakdown Summary Report
-        run: |
-          echo "Generating Breakdown Summary Report..."
-          # Trigger report generation
-          curl -s -u ${{ secrets.SONAR_TOKEN }}: \
-            -X POST "${{ secrets.SONAR_HOST_URL }}/api/report" \
-            -d "component=Rivvun-Intelligence" \
-            -d "branch=main" \
-            -d "format=PDF" \
-            -d "type=breakdown"
-          
-          # Wait for report generation
-          sleep 10
-          
-          # Download the report
-          curl -s -u ${{ secrets.SONAR_TOKEN }}: \
-            "${{ secrets.SONAR_HOST_URL }}/api/report/download?component=Rivvun-Intelligence&branch=main&format=PDF&type=breakdown" \
-            -o sonar-reports/breakdown-summary-report.pdf || echo "Breakdown report download attempted"
-
-      - name: List Downloaded Reports
-        run: |
-          echo "Reports in sonar-reports directory:"
-          ls -la sonar-reports/ || echo "Directory may be empty"
-
-      - name: Upload Reports as Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: sonarqube-pdf-reports
-          path: sonar-reports/*.pdf
-          retention-days: 30
-
+          done
+     
       - name: Shutdown VM (if started by this workflow)
         if: steps.check-vm.outputs.vm_started == 'true'
         run: |
